@@ -42,7 +42,7 @@ def get_testing():
 def get_r50_b16_config():
     """Returns the Resnet50 + ViT-B/16 configuration."""
     config = get_b16_config()
-    config.patches.grid = (16, 16)
+    config.patches.grid = (8, 8)
     config.resnet = ml_collections.ConfigDict()
     config.resnet.num_layers = (3, 4, 9)
     config.resnet.width_factor = 1
@@ -51,7 +51,7 @@ def get_r50_b16_config():
     config.pretrained_path = '../model/vit_checkpoint/imagenet21k/R50+ViT-B_16.npz'
     config.decoder_channels = (256, 128, 64, 16)
     config.skip_channels = [512, 256, 64, 16]
-    config.n_classes = 2
+    config.n_classes = 4
     config.n_skip = 3
     config.activation = 'softmax'
 

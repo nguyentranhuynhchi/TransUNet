@@ -1,0 +1,26 @@
+# Bytecode & Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Outputs & Checkpoints
+outputs/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.npz
+*.npy
+*.h5
+*.nii
+*.nii.gz
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
