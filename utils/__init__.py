@@ -16,5 +16,6 @@ else:
 
 from . import optimization
 from . import metrics
+from . import efficiency
 
-__all__ = ["DiceLoss", "optimization", "metrics"]
+__all__ = ["DiceLoss", "optimization", "metrics", "efficiency"]
