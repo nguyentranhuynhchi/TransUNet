@@ -1,15 +1,16 @@
-"""Evaluation script for TransUNet on MyoPS380 test set.
+"""Evaluation script for TransUNet on MyoPS380 or MyoPS++ ROI test sets.
 
-Protocol: myops380_voxel_v3 (Shared Evaluator)
+Protocols: myops380_voxel_v3 / myopspp_roi128_voxel_v1 (shared metric formulas)
 Outputs:
   1) <run_dir>/test_predictions/<CaseID>_pred.npz (Canonical label format, label 3 is Scar)
   2) <output_dir>/per_case.csv (Full per-case, per-region breakdown)
-  3) <output_dir>/metrics.json (Official benchmark summary matching SCAR schema)
+  3) <output_dir>/metrics.json (Dataset-specific summary matching SCAR schema)
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import json
 import logging
 import math
@@ -23,7 +24,8 @@ import numpy as np
 from scipy.ndimage import zoom
 import torch
 
-from datasets.dataset_myops import MyopsVolumeDataset, canonicalize_label
+from datasets.dataset_myops import MyopsVolumeDataset
+from datasets.dataset_myopspp import MyopsPPVolumeDataset, resolve_dataset_format, validate_data_checkpoint
 from networks.vit_seg_modeling import VisionTransformer, CONFIGS
 from utils.metrics import BENCHMARK_PROTOCOL, dataset_rows, summarize_dataset_rows
 
@@ -52,7 +54,8 @@ def json_safe(val: Any) -> Any:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate TransUNet on MyoPS380 official 76 test cases")
+    parser = argparse.ArgumentParser(description="Evaluate TransUNet on MyoPS380 or MyoPS++ ROI test cases")
+    parser.add_argument("--dataset", choices=["auto", "myops380", "myopspp"], default="auto", help="Dataset format (default: detect from --data-root)")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -63,13 +66,13 @@ def parse_args() -> argparse.Namespace:
         "--data-root",
         type=str,
         default=os.environ.get("LOCAL_DATASET", "E:/STUDY/DATASET/MyoPS380/Processed_data"),
-        help="Path to preprocessed MyoPS380 dataset root containing bSSFP, LGE, T2w",
+        help="MyoPS380 bSSFP/LGE/T2w root, or MyoPS++ root containing cases/ and splits.json",
     )
     parser.add_argument(
         "--list-dir",
         type=str,
         default="lists/lists_MyoPS380",
-        help="Path to split manifests folder containing test_vol.txt",
+        help="MyoPS380 test manifests; MyoPS++ always uses <data-root>/splits.json",
     )
     parser.add_argument(
         "--output-dir",
@@ -131,6 +134,18 @@ def main() -> None:
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
 
+    dataset_format = resolve_dataset_format(args.data_root, args.dataset)
+    if dataset_format == "myopspp":
+        dataset = MyopsPPVolumeDataset(args.data_root)
+        data_protocol = dataset.data_protocol
+    else:
+        dataset = MyopsVolumeDataset(args.data_root, args.list_dir, split="test_vol", label_order="legacy")
+        data_protocol = None
+    metric_protocol = copy.deepcopy(BENCHMARK_PROTOCOL)
+    if dataset_format == "myopspp":
+        metric_protocol["id"] = "myopspp_roi128_voxel_v1"
+        metric_protocol["evaluation_scope"] = "cropped ROI; distances in voxels, not native-image millimeters"
+
     # Default output directory: <run_dir>/evaluation
     run_dir = ckpt_path.parent.parent
     output_dir = Path(args.output_dir) if args.output_dir else (run_dir / "evaluation")
@@ -150,7 +165,7 @@ def main() -> None:
     )
 
     logger.info("================================================================================")
-    logger.info("TransUNet MyoPS380 Evaluation - Protocol: myops380_voxel_v3")
+    logger.info("TransUNet %s Evaluation - Protocol: %s", dataset_format, metric_protocol["id"])
     logger.info("Checkpoint: %s", ckpt_path)
     logger.info("Output directory: %s", output_dir)
     logger.info("Prediction directory: %s", pred_dir)
@@ -168,19 +183,13 @@ def main() -> None:
     # Load weights
     logger.info("Loading checkpoint weights...")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    validate_data_checkpoint(ckpt, data_protocol)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     logger.info("Model loaded successfully. Trainable params: %s", f"{sum(p.numel() for p in model.parameters()):,}")
 
-    # Load volume dataset
-    dataset = MyopsVolumeDataset(
-        data_root=args.data_root,
-        list_dir=args.list_dir,
-        split="test_vol",
-        label_order="legacy",
-    )
     logger.info("Total test volume cases: %d", len(dataset))
 
     all_metric_rows: list[dict[str, Any]] = []
@@ -248,7 +257,8 @@ def main() -> None:
         # Summarize rows and write metrics.json
         summary = summarize_dataset_rows(all_metric_rows)
         metrics_payload = {
-            "protocol": BENCHMARK_PROTOCOL,
+            "protocol": metric_protocol,
+            "data_protocol": data_protocol,
             "checkpoint": str(ckpt_path),
             "total_cases": len(dataset),
             "summary": summary,
@@ -259,7 +269,7 @@ def main() -> None:
         logger.info("Summary metrics saved to: %s", json_file)
 
         logger.info("================================================================================")
-        logger.info("BENCHMARK RESULTS SUMMARY (Protocol: myops380_voxel_v3)")
+        logger.info("BENCHMARK RESULTS SUMMARY (Protocol: %s)", metric_protocol["id"])
         logger.info("Avg Pathology Dice (Scar & Edema-Excl):        %.4f", summary.get("avg_pathology_dice") or 0.0)
         logger.info("Avg Pathology Inclusive Dice (Scar & Edema-Inc): %.4f", summary.get("avg_pathology_inclusive_dice") or 0.0)
         for r_name in ("scar", "edema", "edema_inclusive", "normal_myocardium", "myocardial_ring"):

@@ -1,7 +1,8 @@
-"""Training script for TransUNet on MyoPS380 (no-val protocol).
+"""Training script for TransUNet on MyoPS380 or MyoPS++ (no-val protocol).
 
-Protocol: myops380_train304_test76_last_v1
-Budget: 300 epochs, physical batch 16, 37,200 total updates.
+MyoPS380 protocol: myops380_train304_test76_last_v1
+MyoPS++ protocol: myopspp_roi128_aug380_last_v2 (patient split from splits.json)
+Default budget: 300 epochs, physical batch 16; updates follow dataset length.
 Objective: 0.5 * CrossEntropyLoss + 0.5 * DiceLoss
 Optimizer: AdamW (lr=0.0003333, wd=0.0001, betas=(0.9, 0.999))
 Scheduler: Polynomial decay (power=0.9, zero-based offset)
@@ -25,7 +26,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from datasets.dataset_myops import MyopsDataset, RandomGenerator
+from datasets.dataset_myops import MyopsDataset, RandomGenerator, read_split_lines
+from datasets.dataset_myopspp import MyopsPPDataset, resolve_dataset_format, validate_data_checkpoint
 from networks.vit_seg_modeling import VisionTransformer, CONFIGS
 from utils import DiceLoss
 from utils.optimization import (
@@ -36,6 +38,34 @@ from utils.optimization import (
 )
 
 logger = logging.getLogger("TransUNet_Train")
+
+TRAIN_AUGMENTATION_PROTOCOL = {
+    "id": "im_mseg_legacy255_v1",
+    "output_size": [128, 128],
+    "intensity_max": 255.0,
+    "post_resize_clip": False,
+}
+
+
+def build_train_transform() -> RandomGenerator:
+    """Use the exact MyoPS380 augmentation for BOTH datasets on [0,1] inputs."""
+    return RandomGenerator(
+        output_size=TRAIN_AUGMENTATION_PROTOCOL["output_size"],
+        intensity_max=TRAIN_AUGMENTATION_PROTOCOL["intensity_max"],
+    )
+
+
+def validate_augmentation_checkpoint(checkpoint: dict[str, Any], dataset_format: str) -> None:
+    saved = checkpoint.get("augmentation_protocol")
+    if saved == TRAIN_AUGMENTATION_PROTOCOL:
+        return
+    # Original MyoPS380 runs already used this exact augmentation without metadata.
+    if saved is None and dataset_format == "myops380" and checkpoint.get("training_protocol", {}).get("cohort") == "myops380":
+        return
+    raise ValueError(
+        "Checkpoint augmentation differs from the shared MyoPS380 legacy255 protocol. "
+        "Older MyoPS++ checkpoints used intensity_max=1. Start a fresh run with --run-name <new-name>."
+    )
 
 
 def seed_everything(seed: int, deterministic: bool = True) -> None:
@@ -80,18 +110,19 @@ def resolve_amp(mode: str, device: torch.device) -> torch.dtype | None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train TransUNet on MyoPS380 without validation")
+    parser = argparse.ArgumentParser(description="Train TransUNet on MyoPS380 or MyoPS++ without validation")
+    parser.add_argument("--dataset", choices=["auto", "myops380", "myopspp"], default="auto", help="Dataset format (default: detect from --data-root)")
     parser.add_argument(
         "--data-root",
         type=str,
         default=os.environ.get("LOCAL_DATASET", "E:/STUDY/DATASET/MyoPS380/Processed_data"),
-        help="Path to preprocessed MyoPS380 dataset root containing bSSFP, LGE, T2w",
+        help="MyoPS380 bSSFP/LGE/T2w root, or MyoPS++ root containing cases/ and splits.json",
     )
     parser.add_argument(
         "--list-dir",
         type=str,
         default="lists/lists_MyoPS380",
-        help="Path to split manifests folder containing train.txt and test_vol.txt",
+        help="MyoPS380 split manifests; MyoPS++ always uses <data-root>/splits.json",
     )
     parser.add_argument(
         "--pretrained",
@@ -109,7 +140,7 @@ def parse_args() -> argparse.Namespace:
         "--run-name",
         type=str,
         default=None,
-        help="Custom run directory name (default: transunet_seed<seed>)",
+        help="Custom run directory name (default: transunet_seed<seed>, or transunet_myopspp_seed<seed>)",
     )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed (default: 1234)")
     parser.add_argument("--batch-size", type=int, default=16, help="Physical batch size (default: 16)")
@@ -125,9 +156,37 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.epochs < 1 or args.batch_size < 1 or args.num_workers < 0:
+        raise ValueError("epochs/batch-size must be positive and num-workers must be nonnegative")
+    if args.resume and not Path(args.resume).is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+
+    dataset_format = resolve_dataset_format(args.data_root, args.dataset)
+    transform = build_train_transform()
+    if dataset_format == "myopspp":
+        train_dataset = MyopsPPDataset(args.data_root, transform=transform)
+        train_patients = len(train_dataset.patients["train"])
+        test_patients = len(train_dataset.patients["test_vol"])
+        data_protocol = train_dataset.data_protocol
+        protocol_id = "myopspp_roi128_aug380_last_v2"
+    else:
+        train_dataset = MyopsDataset(args.data_root, args.list_dir, transform=transform, label_order="legacy")
+        train_patients = len({name.rsplit("_slice", 1)[0] for name in train_dataset.sample_list})
+        test_patients = len(read_split_lines(args.list_dir, "test_vol"))
+        data_protocol = None
+        protocol_id = "myops380_train304_test76_last_v1"
+    training_protocol = {
+        "id": protocol_id,
+        "cohort": dataset_format,
+        "train_patients": train_patients,
+        "train_slices": len(train_dataset),
+        "test_patients": test_patients,
+        "epochs": args.epochs,
+    }
 
     # Determine run directory and checkpoint path
-    run_name = args.run_name or f"transunet_seed{args.seed}"
+    run_prefix = "transunet_myopspp" if dataset_format == "myopspp" else "transunet"
+    run_name = args.run_name or f"{run_prefix}_seed{args.seed}"
     run_dir = Path(args.run_root) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     log_dir = run_dir / "logs"
@@ -135,6 +194,7 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_path = checkpoint_dir / f"transunet_seed{args.seed}.pt"
+    resume_file = args.resume or (ckpt_path if ckpt_path.is_file() else None)
 
     # Setup logger
     logging.basicConfig(
@@ -147,8 +207,13 @@ def main() -> None:
     )
 
     logger.info("================================================================================")
-    logger.info("TransUNet MyoPS380 Training - Protocol: myops380_train304_test76_last_v1")
+    logger.info("TransUNet %s Training - Protocol: %s", dataset_format, protocol_id)
     logger.info("Run directory: %s", run_dir)
+    logger.info("Dataset: %s | train/test patients %d/%d", Path(args.data_root).resolve(), train_patients, test_patients)
+    logger.info("Shared augmentation: %s | brightness/gamma scale 255 | no post-resize clipping", TRAIN_AUGMENTATION_PROTOCOL["id"])
+    if data_protocol is not None:
+        logger.info("Channels: C0, LGE, T2 | raw 0/500/600 -> 0, 200 -> 1, 1220 -> 2 (edema), 2221 -> 3 (scar)")
+        logger.info("Targets are canonical before augmentation; CE and Dice receive the same torch.long labels without further remapping.")
     logger.info("================================================================================")
 
     # Seed
@@ -167,14 +232,15 @@ def main() -> None:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.info(
-        "INFO | Device %s | AMP %s | parameters %s | train/val slices 1972/0 | effective batch <= %d",
+        "INFO | Device %s | AMP %s | parameters %s | train/val slices %d/0 | effective batch <= %d",
         device.type,
         str(amp_dtype) if amp_dtype else "fp32",
         f"{total_params:,}",
+        len(train_dataset),
         args.batch_size,
     )
 
-    # Save run configuration
+    # Prepare configuration; write only after checkpoint compatibility is checked.
     config_dict = {
         "model_id": "transunet",
         "architecture": "R50-ViT-B_16",
@@ -184,24 +250,23 @@ def main() -> None:
         "img_size": 128,
         "patches_grid": [8, 8],
         "training_protocol": {
-            "id": "myops380_train304_test76_last_v1",
-            "epochs": args.epochs,
+            **training_protocol,
             "physical_batch": args.batch_size,
             "accum_steps": 1,
             "no_val": True,
         },
         "optimization_protocol": OPTIMIZATION_PROTOCOL,
+        "augmentation_protocol": TRAIN_AUGMENTATION_PROTOCOL,
+        "data_protocol": data_protocol,
+        "data_root": str(Path(args.data_root).resolve()),
         "base_lr": args.lr,
         "weight_decay": args.weight_decay,
         "seed": args.seed,
         "device": device.type,
         "amp": str(amp_dtype) if amp_dtype else "none",
     }
-    with open(log_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, indent=2)
-
     # Load pretrained weights if provided and not resuming
-    if args.pretrained and not args.resume:
+    if args.pretrained and not resume_file:
         logger.info("Loading pretrained ViT weights from: %s", args.pretrained)
         weights = np.load(args.pretrained)
         model.load_from(weights)
@@ -209,15 +274,7 @@ def main() -> None:
 
     model.to(device)
 
-    # Dataset & Dataloader
-    transform = RandomGenerator(output_size=(128, 128))
-    train_dataset = MyopsDataset(
-        data_root=args.data_root,
-        list_dir=args.list_dir,
-        split="train",
-        transform=transform,
-        label_order="legacy",
-    )
+    # Dataloader (dataset-specific adapters above already return canonical targets).
     logger.info("Loaded train dataset: %d slices", len(train_dataset))
 
     g = torch.Generator()
@@ -235,7 +292,7 @@ def main() -> None:
     )
 
     batches_per_epoch = len(train_loader)
-    total_planned_updates = args.epochs * batches_per_epoch  # 300 * 124 = 37,200
+    total_planned_updates = args.epochs * batches_per_epoch
     logger.info("Batches per epoch: %d | Total planned updates: %d", batches_per_epoch, total_planned_updates)
 
     # Loss, Optimizer, Scheduler
@@ -253,10 +310,11 @@ def main() -> None:
     total_updates = 0
 
     # Resume handling
-    resume_file = args.resume or (ckpt_path if ckpt_path.is_file() else None)
     if resume_file and Path(resume_file).is_file():
         logger.info("Resuming training from checkpoint: %s", resume_file)
         ckpt = torch.load(resume_file, map_location=device, weights_only=False)
+        validate_data_checkpoint(ckpt, data_protocol)
+        validate_augmentation_checkpoint(ckpt, dataset_format)
         validate_optimization_checkpoint(ckpt)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -282,6 +340,9 @@ def main() -> None:
         if ckpt.get("training_complete", False):
             logger.info("Training was already marked complete at epoch %d. Nothing to run.", ckpt["epoch"])
             return
+
+    with open(log_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2)
 
     # Training loop
     logger.info("Starting training loop from epoch %d to %d...", start_epoch, args.epochs)
@@ -374,14 +435,9 @@ def main() -> None:
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict() if use_scaler else None,
             "rng_state": rng_state,
-            "training_protocol": {
-                "id": "myops380_train304_test76_last_v1",
-                "cohort": "myops380",
-                "train_patients": 304,
-                "train_slices": 1972,
-                "test_patients": 76,
-                "epochs": args.epochs,
-            },
+            "training_protocol": training_protocol,
+            "data_protocol": data_protocol,
+            "augmentation_protocol": TRAIN_AUGMENTATION_PROTOCOL,
             "optimization_protocol": OPTIMIZATION_PROTOCOL,
             "loss_metric": {
                 "loss_total": avg_loss,
@@ -396,7 +452,7 @@ def main() -> None:
         tmp_ckpt.replace(ckpt_path)
 
     logger.info("================================================================================")
-    logger.info("Training complete! 300 epochs finished. Final checkpoint saved at: %s", ckpt_path)
+    logger.info("Training complete! %d epochs finished. Final checkpoint saved at: %s", args.epochs, ckpt_path)
     logger.info("================================================================================")
 
 

@@ -73,8 +73,12 @@ def add_gaussian_noise(image, image1, image2, label, mean=0, std=0.2):
 class RandomGenerator:
     """Reproduces I-MMSeg augmentation (6 steps, synced RNG across modalities)."""
 
-    def __init__(self, output_size: Sequence[int] = (128, 128)):
+    def __init__(self, output_size: Sequence[int] = (128, 128), intensity_max: float = 255.0):
         self.output_size = tuple(output_size)
+        # Preserve the original MyoPS380 behavior, shared by both training datasets.
+        if not np.isfinite(intensity_max) or intensity_max <= 0:
+            raise ValueError("intensity_max must be finite and positive")
+        self.intensity_max = float(intensity_max)
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         image, image1, image2, label = sample["image"], sample["image1"], sample["image2"], sample["label"]
@@ -99,16 +103,16 @@ class RandomGenerator:
         # Step 3: Brightness
         if random.random() > 0.5:
             factor = random.uniform(0.8, 1.2)
-            image = np.clip(image * factor, 0, 255)
-            image1 = np.clip(image1 * factor, 0, 255)
-            image2 = np.clip(image2 * factor, 0, 255)
+            image = np.clip(image * factor, 0, self.intensity_max)
+            image1 = np.clip(image1 * factor, 0, self.intensity_max)
+            image2 = np.clip(image2 * factor, 0, self.intensity_max)
 
         # Step 4: Gamma
         if random.random() > 0.5:
             gamma = random.uniform(0.8, 1.2)
-            image = np.power(image / 255.0, gamma) * 255.0
-            image1 = np.power(image1 / 255.0, gamma) * 255.0
-            image2 = np.power(image2 / 255.0, gamma) * 255.0
+            image = np.power(image / self.intensity_max, gamma) * self.intensity_max
+            image1 = np.power(image1 / self.intensity_max, gamma) * self.intensity_max
+            image2 = np.power(image2 / self.intensity_max, gamma) * self.intensity_max
 
         # Step 5: Random crop
         if random.random() > 0.5:
@@ -126,6 +130,10 @@ class RandomGenerator:
             image1 = zoom(image1, (self.output_size[0] / x, self.output_size[1] / y), order=3)
             image2 = zoom(image2, (self.output_size[0] / x, self.output_size[1] / y), order=3)
             label = zoom(label, (self.output_size[0] / x, self.output_size[1] / y), order=0)
+
+        if self.intensity_max == 1.0:
+            # Cubic interpolation can overshoot the normalized intensity range.
+            image, image1, image2 = (np.clip(a, 0, 1) for a in (image, image1, image2))
 
         # Early-fusion: stack (3, H, W)
         stacked = np.stack([image.astype(np.float32), image1.astype(np.float32), image2.astype(np.float32)], axis=0)
